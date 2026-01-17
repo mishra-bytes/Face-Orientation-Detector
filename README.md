@@ -229,3 +229,805 @@ For each fold:
 * Fold histories saved as JSON
 * All plots saved to disk
 
+Excellent.
+This is **Chunk 2** of the documentation.
+
+
+
+# Face Side-View Keypoint Prediction
+
+## Detailed Codebase Documentation (Chunk 2)
+
+
+
+## 13. Global Configuration (`src/config.py`)
+
+### Purpose
+
+`config.py` defines **all global, experiment-wide configuration** in one place.
+This file ensures:
+
+* No magic numbers scattered across the code
+* Hardware-aware defaults
+* Centralized reproducibility
+* Safe runtime overrides via CLI
+
+
+
+### 13.1 Design Philosophy
+
+* **Stateless class**: configuration is accessed via class attributes
+* **Pathlib everywhere**: avoids OS-dependent path bugs
+* **Runtime override allowed**: values like folds, learning rate, sigma, etc. can be overridden by CLI
+* **Hardware-aware defaults**: tuned for DGX-class machines but works everywhere
+
+
+
+### 13.2 Configuration Fields (Explained)
+
+#### Paths
+
+```python
+DATA_ROOT
+TRAIN_IMG_DIR
+TRAIN_COCO
+TEST_IMG_DIR
+TEST_COCO
+```
+
+* `DATA_ROOT`: Root folder containing datasets
+* `TRAIN_IMG_DIR`: Folder containing training images
+* `TRAIN_COCO`: COCO-format annotations for training
+* `TEST_IMG_DIR`: Folder containing test images
+* `TEST_COCO`: Optional COCO annotations for test (if available)
+
+All paths are **resolved once** and reused everywhere.
+
+
+
+#### Experiment Output
+
+```python
+WORK_DIR
+```
+
+* Root directory where **all outputs** are written:
+
+  * checkpoints
+  * logs
+  * visualizations
+  * inference results
+
+Each pipeline and benchmark run creates its own isolated `WORK_DIR`.
+
+
+
+#### Randomness & Reproducibility
+
+```python
+SEED
+```
+
+* Used for:
+
+  * Python `random`
+  * NumPy
+  * PyTorch (CPU & CUDA)
+* Guarantees deterministic splits and behavior (within CUDA limits)
+
+
+
+#### Model Parameters
+
+```python
+IMG_SIZE = 512
+HM_SIZE = 64
+NUM_KPTS = 26
+SIGMA
+```
+
+* `IMG_SIZE`: Input image resolution (square)
+* `HM_SIZE`: Heatmap resolution
+* `NUM_KPTS`: Number of facial keypoints
+* `SIGMA`: Gaussian standard deviation for heatmap generation
+
+`sigma` is **not fixed** — it is explicitly tunable and was optimized via Optuna.
+
+
+
+#### Training Defaults
+
+```python
+BATCH_SIZE
+NUM_WORKERS
+FOLDS
+EPOCHS
+LR
+WEIGHT_DECAY
+ALPHA
+SOFTARGMAX_T
+EARLY_STOP_PATIENCE
+```
+
+* `FOLDS`: Number of cross-validation folds
+* `ALPHA`: Weight between heatmap loss and coordinate loss
+* `SOFTARGMAX_T`: Temperature controlling softargmax sharpness
+* `EARLY_STOP_PATIENCE`: Stops training if no improvement is seen
+
+All of these are **runtime-overridable via CLI**.
+
+
+
+#### Hardware Settings
+
+```python
+DEVICE
+AMP_ENABLED
+AMP_DTYPE
+PIN_MEMORY
+PERSISTENT_WORKERS
+GRAD_CLIP_NORM
+```
+
+* `DEVICE`: CUDA if available, else CPU
+* `AMP_ENABLED`: Enables mixed precision
+* `AMP_DTYPE`: Typically `float16` on A100
+* `PIN_MEMORY`: Faster host→device transfers
+* `PERSISTENT_WORKERS`: Keeps DataLoader workers alive
+* `GRAD_CLIP_NORM`: Optional gradient clipping
+
+
+
+### 13.3 `Config.setup()`
+
+This method:
+
+* Creates necessary directories
+* Ensures `WORK_DIR` exists
+* Is called **once at program start**
+
+No configuration is assumed to exist beforehand.
+
+
+
+## 14. Utilities (`src/utils.py`)
+
+### Purpose
+
+`utils.py` contains **infrastructure code** used across all modules:
+
+* Logging
+* Seeding
+* Atomic file writes
+* Worker initialization
+* Work directory switching
+
+None of these functions perform ML logic — they support reliability.
+
+
+
+### 14.1 Logging (`get_logger`)
+
+```python
+get_logger(name, log_file)
+```
+
+Creates a **dual-output logger**:
+
+* Writes to a log file
+* Streams to console
+
+Features:
+
+* Timestamped entries
+* One logger per logical unit (main, fold, dataset, inference)
+* Prevents silent failures
+
+Why this matters:
+
+* Training on long runs (DGX) requires persistent logs
+* Fold-level logs allow forensic debugging
+
+
+
+### 14.2 Seeding (`seed_everything`)
+
+```python
+seed_everything(seed, deterministic=True)
+```
+
+Sets seeds for:
+
+* Python `random`
+* NumPy
+* PyTorch CPU
+* PyTorch CUDA
+
+Also configures:
+
+* `cudnn.deterministic`
+* `cudnn.benchmark`
+
+This ensures:
+
+* Identical fold splits
+* Comparable benchmark runs
+* Stable Optuna evaluations
+
+
+### 14.3 DataLoader Worker Init
+
+```python
+worker_init_fn(worker_id)
+```
+
+Ensures:
+
+* Each DataLoader worker has a deterministic seed
+* Augmentations are reproducible
+
+This prevents subtle randomness differences between runs.
+
+
+
+### 14.4 Atomic File Writes
+
+```python
+atomic_write_text(path, text)
+```
+
+Writes files safely by:
+
+1. Writing to a temporary file
+2. Renaming it atomically
+
+This prevents:
+
+* Partial JSON writes
+* Corrupted summaries during crashes
+* Incomplete visualization metadata
+
+Used for:
+
+* CV summaries
+* Fold histories
+* Benchmark results
+
+
+
+### 14.5 Work Directory Switching
+
+```python
+set_work_dir(path)
+```
+
+Allows the benchmark suite to:
+
+* Dynamically change `WORK_DIR`
+* Isolate outputs per pipeline
+* Run v1–v4 sequentially without conflicts
+
+This is a **critical enabler** of the benchmark suite.
+
+
+
+## 15. Why These Utilities Matter
+
+Without these utilities:
+
+* Logs would overwrite each other
+* Results would not be reproducible
+* Benchmarks would not be comparable
+* Long runs could silently fail
+
+
+
+
+
+
+
+# Face Side-View Keypoint Prediction
+
+
+
+
+
+## 16. Preprocessing Pipelines (`src/preprocess.py`)
+
+### Purpose
+
+`preprocess.py` implements **all image preprocessing logic** used by the system.
+
+This module is **the only place** where preprocessing differs across pipelines (v1–v4).
+Everything downstream (dataset, model, training, inference) remains identical.
+
+This strict separation ensures:
+
+* Fair benchmarking
+* No code duplication
+* Clear attribution of performance differences
+
+
+
+## 17. Preprocessing Interface (Critical Design)
+
+All pipelines implement the same interface:
+
+```python
+gray_512, meta = preprocess_image(img_bgr, pipeline)
+```
+
+### Outputs
+
+| Output     | Description                                                |
+| ---------- | ---------------------------------------------------------- |
+| `gray_512` | `float32` grayscale image of shape `(512, 512)` in `[0,1]` |
+| `meta`     | Metadata used to map predictions back to original image    |
+
+This design guarantees:
+
+* Model always sees identical input shape
+* Inference overlays are geometrically correct
+* Ensemble predictions are aligned
+
+
+
+## 18. Metadata (`meta`) Explained
+
+The `meta` dictionary typically contains:
+
+```python
+meta = {
+    "orig_shape": (H, W),
+    "roi": (x1, y1, x2, y2),
+    "scale_x": float,
+    "scale_y": float,
+}
+```
+
+Used during inference to:
+
+* Convert predicted `(x, y)` from 512-space → original image space
+* Draw overlays accurately
+* Compute latency per image
+
+
+
+## 19. Pipeline v1 — Hybrid YOLO (Baseline)
+
+### Description
+
+This is the **primary, most accurate pipeline**.
+
+Steps:
+
+1. **YOLO Detection**
+
+   * Detect person / face bounding box
+2. **ROI Expansion**
+
+   * Expand bounding box to include hair, accessories
+3. **Adaptive Resolution Selection**
+
+   * Chooses segmentation resolution based on ROI size
+4. **YOLO Segmentation**
+
+   * Segment subject inside ROI
+5. **Mask Cleanup**
+
+   * Morphological closing
+   * Largest connected component selection
+6. **Background Removal**
+
+   * Apply mask to image
+7. **Grayscale Conversion**
+8. **Resize to 512×512**
+
+### Why this works well
+
+* Removes clutter
+* Preserves facial geometry
+* Robust to side views and occlusions
+
+
+
+## 20. Pipeline v2 — Hybrid YOLO + Contrast Enhancement
+
+### Difference from v1
+
+After grayscale conversion:
+
+```text
+Grayscale → CLAHE → Normalize
+```
+
+### CLAHE (Contrast Limited Adaptive Histogram Equalization)
+
+* Improves local contrast
+* Helps in:
+
+  * Low-light images
+  * Shadows
+  * Overexposed regions
+
+### Why benchmark this
+
+* Improves edge visibility
+* Can help heatmap learning
+* May increase noise → needs empirical validation
+
+
+
+## 21. Pipeline v3 — DNN SSD ROI Only
+
+### Description
+
+This pipeline **removes background removal entirely**.
+
+Steps:
+
+1. **OpenCV DNN SSD Face Detection**
+2. **ROI Expansion**
+3. **Crop ROI**
+4. **Resize to 512×512**
+5. **Grayscale Conversion**
+
+No segmentation, no masking.
+
+### Advantages
+
+* Much faster preprocessing
+* No YOLO segmentation overhead
+* Lower latency
+
+### Tradeoff
+
+* Background clutter remains
+* Model must learn robustness implicitly
+
+
+
+## 22. Pipeline v4 — DNN SSD + Contrast Enhancement
+
+Same as v3, plus:
+
+```text
+Grayscale → CLAHE → Normalize
+```
+
+This tests whether **contrast enhancement compensates for lack of segmentation**.
+
+
+
+## 23. DNN SSD Details
+
+Uses OpenCV’s pretrained SSD:
+
+```python
+deploy.prototxt
+res10_300x300_ssd_iter_140000.caffemodel
+```
+
+Key characteristics:
+
+* CPU-based
+* Deterministic
+* No CUDA dependency
+* Lightweight
+
+ROI padding ensures:
+
+* No facial parts are clipped
+* Comparable geometry to YOLO ROI
+
+
+
+## 24. Fallback Logic (Robustness)
+
+If detection fails:
+
+* YOLO pipeline falls back to full-image segmentation
+* SSD pipeline falls back to full-image crop
+
+This ensures:
+
+* No sample crashes the pipeline
+* Dataset integrity is preserved
+
+
+
+## 25. Why Preprocessing Is Central to This Project
+
+The **entire benchmark suite exists to answer one question**:
+
+> How much does preprocessing choice affect accuracy vs latency in face keypoint prediction?
+
+By isolating preprocessing here:
+
+* Training logic stays unchanged
+* Metrics remain comparable
+* Results are defensible in a paper or review
+
+
+
+
+
+
+## 26. Dataset & Data Pipeline (`src/dataset.py`)
+
+### Purpose
+
+`dataset.py` is responsible for the entire **training-time data preparation** pipeline:
+
+* COCO parsing
+* Loading images and keypoints
+* Applying preprocessing pipelines (v1–v4)
+* Applying augmentations
+* Generating heatmaps
+* Returning tensors ready for training
+
+This file is a major correctness-critical component because it directly controls:
+
+* data integrity
+* geometry correctness
+* visibility logic
+* heatmap alignment
+* training stability
+
+
+
+## 27. COCO Loader: `load_coco(...)`
+
+### Signature
+
+```python
+coco_images, coco_anns, img_ids = load_coco(coco_json_path)
+```
+
+### Returns
+
+| Variable      | Meaning                                             |
+| ------------- | --------------------------------------------------- |
+| `coco_images` | Dict mapping image_id → COCO image metadata         |
+| `coco_anns`   | Dict mapping image_id → annotation (keypoints etc.) |
+| `img_ids`     | Ordered list of image ids present in COCO           |
+
+### Why it is written this way
+
+* Fast random access by `img_id`
+* Avoids scanning entire JSON per sample
+* Keeps dataset deterministic
+
+
+
+## 28. Augmentations
+
+Two augmentation objects are used:
+
+### `TRAIN_AUG`
+
+Applied during training only.
+Includes:
+
+* Random affine transforms (rotation, scale, translation)
+* Brightness/contrast perturbations
+* Gaussian noise
+* Coarse dropout
+
+The keypoint augmentation mode is:
+
+```python
+keypoint_params=A.KeypointParams(format="xy", remove_invisible=False)
+```
+
+Meaning:
+
+* Keypoints are treated as `(x,y)` pairs
+* Keypoints are transformed consistently with the image
+* Invisible points are not removed automatically (visibility is handled explicitly)
+
+
+
+### `VAL_AUG`
+
+Empty augmentation pipeline
+
+* Preserves original data
+* Ensures validation is stable and comparable
+
+
+
+## 29. Heatmap Generation: `generate_heatmaps(...)`
+
+### Purpose
+
+Convert sparse keypoints into dense supervision targets.
+
+### Inputs
+
+```python
+generate_heatmaps(kps, hm_size, sigma)
+```
+
+* `kps`: `(K, 3)` array, each keypoint is `(x, y, v)`
+* `hm_size`: heatmap resolution (64)
+* `sigma`: gaussian blur radius
+
+### Output
+
+* Heatmaps shape: `(K, hm_size, hm_size)`
+* Each heatmap is a 2D gaussian centered at the keypoint
+
+### Visibility handling
+
+* If `v == 0` (not visible), that heatmap stays all zeros
+
+### Scaling
+
+Keypoints are in `IMG_SIZE` coordinate space (512).
+Heatmaps are in `HM_SIZE` space (64).
+So the gaussian center is scaled by:
+
+```python
+scale = HM_SIZE / IMG_SIZE
+```
+
+
+
+## 30. Dataset Class: `FaceKeypointDataset`
+
+### Signature
+
+```python
+FaceKeypointDataset(
+    img_ids,
+    coco_images,
+    coco_anns,
+    img_dir,
+    transform,
+    cache=True,
+    sigma=Config.SIGMA,
+    pipeline="v1",
+    logger_name="dataset",
+    log_file=...
+)
+```
+
+### Key Responsibilities
+
+For each sample:
+
+1. Load raw BGR image
+2. Retrieve keypoints from COCO annotation
+3. Apply preprocessing pipeline (v1–v4)
+4. Convert to grayscale tensor
+5. Apply Albumentations transforms (with keypoints)
+6. Generate heatmaps (gt_hm)
+7. Build visibility mask (vis)
+8. Return tensors
+
+
+
+## 31. Dataset Caching (DGX Optimization)
+
+Caching is enabled by default:
+
+```python
+cache=True
+```
+
+### What caching means
+
+* Samples are preprocessed once
+* Stored in RAM as tensors/arrays
+* Avoids running YOLO/SSD for every epoch
+
+### Why this matters
+
+Preprocessing is expensive:
+
+* YOLO seg is GPU-heavy
+* SSD is CPU-heavy but still costly
+
+Caching ensures:
+
+* Training loop is dominated by model forward/backward (desired)
+* Validation becomes fast and stable
+* Benchmark comparisons are fair
+
+
+
+## 32. Caching Preload: `_preload()`
+
+When caching is enabled:
+
+* Dataset iterates over `img_ids`
+* For each:
+
+  * runs full preprocessing + augmentation (if training dataset)
+  * stores preprocessed output in an internal dict
+
+Progress is shown using `tqdm`, so you can see exactly how long caching takes.
+
+
+
+## 33. Failure Handling
+
+Dataset is designed to never crash training due to one bad sample.
+
+Common failure cases:
+
+* image missing on disk
+* corrupted file
+* ROI cropping returns invalid rectangle
+* detector returns no box
+* segmentation mask is empty
+
+In such cases the dataset:
+
+* logs the issue
+* falls back to full image
+* returns a valid tensor
+
+This prevents:
+
+* failed training jobs after hours of execution
+* incomplete CV folds
+* bias due to sample dropping
+
+
+
+## 34. Returned Tensors (Training Contract)
+
+Each `__getitem__()` returns:
+
+```python
+img, hm, vis, kps
+```
+
+### Shapes
+
+| Tensor | Shape           | Notes                                       |
+| ------ | --------------- | ------------------------------------------- |
+| `img`  | `[1, 512, 512]` | grayscale in float32                        |
+| `hm`   | `[K, 64, 64]`   | heatmaps                                    |
+| `vis`  | `[K]`           | visibility mask {0,1}                       |
+| `kps`  | `[K, 3]`        | keypoints in 512-space, includes visibility |
+
+This is the contract expected by training.
+
+
+
+## 35. Geometry Consistency
+
+A core property of the dataset:
+
+✅ Keypoints always match image content in `512×512` space
+because preprocessing and keypoints are transformed together.
+
+This guarantees:
+
+* correct heatmap centers
+* correct coordinate loss
+* correct PCK evaluation
+
+
+
+## 36. Why Dataset Correctness Dominates Results
+
+If the dataset is wrong, you can still get:
+
+* low loss
+* apparently improving metrics
+
+…but the model will fail on real images.
+
+This dataset implementation is designed to avoid:
+
+* silent keypoint drift
+* misaligned heatmaps
+* incorrect visibility
+* train/val mismatch
+
+
+
