@@ -1029,5 +1029,451 @@ This dataset implementation is designed to avoid:
 * incorrect visibility
 * train/val mismatch
 
+Below is a **single, consolidated, professional documentation section** that covers **everything from Chunk 5 to the end of the codebase**, rewritten cleanly, **without redundancy**, but with **all functions, logic, CLI usage, and experimental details preserved**.
+
+This is written in a style suitable for:
+
+* a serious GitHub repository
+* a technical report appendix
+* or the “Methods / Experimental Setup” section of a paper
+
+
+
+# Model, Training, Inference, and Benchmarking
+
+## Detailed Codebase Documentation (Model → End)
+
+
+
+## 1. Model Architecture (`src/model.py`)
+
+### Purpose
+
+`src/model.py` defines the **entire learnable component** of the system.
+It implements a **heatmap-based facial keypoint regression model** with **Soft-Argmax coordinate extraction**, designed for:
+
+* side-view and non-frontal faces
+* partial visibility and occlusion
+* stable training under cross-validation
+* ensemble inference
+
+The architecture is intentionally lightweight, interpretable, and reproducible.
+
+---
+
+### Architecture Overview
+
+```
+Input: 1 × 512 × 512 (grayscale)
+  ↓
+MobileNetV3-Large (feature extractor)
+  ↓
+Heatmap Head (upsampling CNN)
+  ↓
+K heatmaps (64 × 64)
+  ↓
+Soft-Argmax
+  ↓
+K (x, y) coordinates
+```
+
+The network **predicts heatmaps only**.
+Coordinates are derived externally using a differentiable Soft-Argmax.
+
+
+
+### Backbone: MobileNetV3-Large (Grayscale Adaptation)
+
+The pretrained MobileNetV3 backbone is adapted from RGB to grayscale by:
+
+* replacing the first convolution layer to accept 1 channel
+* initializing its weights as the mean of pretrained RGB filters
+
+This preserves:
+
+* edge detectors
+* spatial inductive bias
+* pretrained benefits
+
+
+### Heatmap Head
+
+The heatmap head upsamples backbone features to produce spatially precise keypoint heatmaps.
+
+Structure:
+
+* Conv → BatchNorm → ReLU
+* Upsample ×2
+* Conv → BatchNorm → ReLU
+* Upsample ×2
+* Final Conv → `NUM_KPTS` channels
+
+Output shape:
+
+```
+[B, NUM_KPTS, HM_SIZE, HM_SIZE]
+```
+
+Each channel corresponds to one facial keypoint.
+
+
+
+### Soft-Argmax (`softargmax_2d`)
+
+#### Function Signature
+
+```python
+softargmax_2d(hm: Tensor, temperature: float) -> Tensor
+```
+
+#### Inputs
+
+* `hm`: `[B, K, H, W]` heatmaps
+* `temperature`: sharpness control
+
+#### Output
+
+* `[B, K, 2]` normalized coordinates in `[0,1]`
+
+Coordinates are later scaled by `IMG_SIZE` to pixel space.
+
+
+
+### Soft-Argmax Temperature (`softargmax_T`)
+
+Controls how peaked the heatmap distribution is.
+
+* Too low → blurry localization
+* Too high → unstable gradients
+
+This parameter is:
+
+* explicitly tuned (e.g. via Optuna)
+* passed consistently to training, validation, and inference
+
+CLI usage:
+
+```bash
+--softargmax_T 9.58347264700672
+```
+
+
+
+## 2. Losses and Metrics (`src/loss.py`)
+
+### Hybrid Loss Function
+
+Training uses a **hybrid loss** combining:
+
+1. **Heatmap MSE loss** (masked by visibility)
+2. **Coordinate L1 loss** (masked by visibility)
+
+```text
+Total Loss = α · Heatmap Loss + (1 − α) · Coordinate Loss
+```
+
+Where:
+
+* `α` is configurable (`--alpha`)
+* invisible keypoints do not contribute to the loss
+
+This balances:
+
+* spatial supervision (heatmaps)
+* geometric precision (coordinates)
+
+
+
+### PCK Metrics (Percentage of Correct Keypoints)
+
+Two thresholds are computed:
+
+* **PCK@0.05** → standard accuracy
+* **PCK@0.02** → high-precision accuracy
+
+Distance is measured in pixel space:
+
+```text
+‖pred − gt‖ < threshold × IMG_SIZE
+```
+
+
+
+### Per-Keypoint PCK
+
+In addition to overall PCK, the code computes:
+
+* per-keypoint PCK values
+* per-keypoint sample counts
+
+These are used to:
+
+* identify weak landmarks
+* generate bar plots
+* support detailed analysis in reports
+
+
+## 3. Training & Validation (`src/train.py`)
+
+### Training Strategy
+
+* N-fold cross-validation (`GroupKFold`)
+* One model per fold
+* Early stopping on validation PCK@0.05
+* Mixed precision training (AMP) on GPU
+
+
+
+### Training Loop (`train_one_epoch`)
+
+For each batch:
+
+1. Forward pass (AMP-enabled)
+2. Heatmap prediction
+3. Soft-Argmax coordinate extraction
+4. Hybrid loss computation
+5. Backpropagation
+6. Optional gradient clipping
+7. Optimizer + scheduler step
+
+Training loss and timing are logged per epoch.
+
+
+
+### Validation Loop (`validate`)
+
+For each validation batch:
+
+* forward pass (no gradients)
+* loss computation
+* prediction storage on CPU
+
+After the epoch:
+
+* overall PCK@0.05, PCK@0.02
+* per-keypoint PCK arrays
+* per-keypoint counts
+
+All metrics are returned explicitly.
+
+
+
+### Fold Execution (`run_fold`)
+
+For each fold:
+
+1. Initialize model, optimizer, scheduler
+2. Train for up to `epochs`
+3. Track best PCK@0.05
+4. Save best checkpoint
+5. Apply early stopping
+6. Save:
+
+   * fold history JSON
+   * per-keypoint PCK arrays
+   * visualizations
+
+Saved under:
+
+```
+experiments/<pipeline>_experiment/
+  checkpoints/
+  viz/
+  logs/
+```
+
+
+
+## 4. Inference & Ensemble (`src/infer.py`)
+
+### Inference Mode: `infer_raw_e2e`
+
+This is a **true end-to-end inference pipeline**, measuring:
+
+```text
+raw image
+ → preprocessing
+ → model forward (all folds)
+ → ensemble aggregation
+ → coordinate projection
+ → overlay generation
+```
+
+
+
+### Ensemble Strategy
+
+* Load best checkpoint from each fold
+* Run all models on the same preprocessed input
+* Average predicted coordinates across folds
+* Produce:
+
+  * per-fold overlays
+  * ensemble overlays
+
+This improves robustness and stability.
+
+
+
+### End-to-End Timing
+
+The following timings are measured per image:
+
+* preprocessing time
+* per-model forward time
+* ensemble aggregation time
+* full end-to-end latency
+
+Statistics reported:
+
+* mean
+* median
+* p90 / p95
+
+Hardware metadata logged:
+
+* GPU model
+* AMP dtype
+* CPU core count
+
+Saved as:
+
+```
+infer_raw_e2e/timing_ensemble.json
+```
+
+
+
+## 5. Visualization (`src/visualize.py`)
+
+### Training Visualizations (per fold)
+
+* training vs validation loss
+* PCK@0.05 / PCK@0.02 curves
+* learning rate schedule
+* per-keypoint PCK bar charts
+
+Saved under:
+
+```
+viz/
+```
+
+
+
+### Inference Visualizations
+
+* predicted keypoints overlaid on **original images**
+* fold-level overlays
+* ensemble overlays
+
+Saved under:
+
+```
+infer_raw_e2e/
+  foldX/overlays/
+  ensemble/overlays/
+```
+
+
+
+### Benchmark Comparison Visualizations
+
+When running the benchmark suite:
+
+* accuracy comparison across pipelines
+* latency comparison across pipelines
+* accuracy vs latency tradeoff plot
+
+Saved under:
+
+```
+benchmark_comparison/
+```
+
+
+
+## 6. Benchmark Suite (`--mode benchmark_suite`)
+
+### Purpose
+
+Run **multiple preprocessing pipelines sequentially**, with:
+
+* identical hyperparameters
+* identical CV splits
+* identical model architecture
+
+Only preprocessing changes.
+
+
+
+### Supported Pipelines
+
+| Pipeline | Description                      |
+| -------- | -------------------------------- |
+| v1       | Hybrid YOLO det → ROI → YOLO seg |
+| v2       | v1 + contrast correction         |
+| v3       | DNN SSD ROI only                 |
+| v4       | v3 + contrast correction         |
+
+
+
+### Example Command (5-fold CV)
+
+```bash
+python main_experiment.py --mode benchmark_suite --folds 5 \
+  --epochs 150 --early_stop_patience 15 \
+  --lr 0.0002376500626274199 \
+  --weight_decay 0.000001986074040054842 \
+  --sigma 2.58765228765362 \
+  --alpha 0.6008870077358692 \
+  --softargmax_T 9.58347264700672 \
+  --batch_size 64 --num_workers 8 \
+  --suite_root experiments/benchmark_suite
+```
+
+
+
+### Outputs
+
+For each pipeline:
+
+```
+experiments/benchmark_suite/vX_experiment/
+```
+
+Global comparison:
+
+```
+experiments/benchmark_suite/benchmark_comparison/
+```
+
+
+
+## 7. Reproducibility & Reliability Guarantees
+
+This codebase guarantees:
+
+* deterministic splits
+* no test leakage
+* isolated experiment folders
+* explicit hyperparameter control
+* full logging of metrics and timing
+* qualitative and quantitative validation
+
+
+
+## 8. Intended Use
+
+This codebase is suitable for:
+
+* academic research
+* ablation studies
+* benchmarking preprocessing strategies
+* deployment feasibility studies
+* reproducible ML experimentation
+
+
+
 
 
